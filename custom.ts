@@ -90,6 +90,49 @@ namespace AnalogLineFollow {
         _rightMotorScale = right / 100.0;
     }
 
+    // 🚀 实战积木 4：精准校准前进 (带自动刹车)
+    //% block="以 $speed 速度前进 持续(ms) $timeMs"
+    //% speed.min=10 speed.max=100 speed.defl=50
+    //% timeMs.defl=1000
+    //% weight=94
+    export function forwardCalibrated(speed: number, timeMs: number): void {
+        let safeSpeed = Math.abs(speed); // 防呆：防止误填负数
+
+        // 直接调用底层拦截器，它会自动帮你乘上底盘校准比例！
+        _setMotorSpeed(safeSpeed, safeSpeed);
+
+        // 同步状态记忆，方便后续如果接平滑刹车能读取到正确速度
+        _lastLeftSpeed = safeSpeed;
+        _lastRightSpeed = safeSpeed;
+
+        basic.pause(timeMs); // 持续运行设定的时间
+
+        // 跑完瞬间刹车，并清零速度记忆
+        _setMotorSpeed(0, 0);
+        _lastLeftSpeed = 0;
+        _lastRightSpeed = 0;
+    }
+
+    // 🚀 实战积木 5：精准校准后退 (带自动刹车)
+    //% block="以 $speed 速度后退 持续(ms) $timeMs"
+    //% speed.min=10 speed.max=100 speed.defl=50
+    //% timeMs.defl=1000
+    //% weight=93
+    export function backwardCalibrated(speed: number, timeMs: number): void {
+        let safeSpeed = Math.abs(speed);
+
+        // 后退就是加上负号，底层依然会完美按比例分配负电压！
+        _setMotorSpeed(-safeSpeed, -safeSpeed);
+        _lastLeftSpeed = -safeSpeed;
+        _lastRightSpeed = -safeSpeed;
+
+        basic.pause(timeMs);
+
+        _setMotorSpeed(0, 0);
+        _lastLeftSpeed = 0;
+        _lastRightSpeed = 0;
+    }
+
     //% block="平滑起步/变速 目标速度 $targetSpeed 步进延迟(ms) $delayMs"
     //% targetSpeed.defl=60 delayMs.defl=20
     //% weight=90
@@ -152,7 +195,7 @@ namespace AnalogLineFollow {
         basic.pause(50);
     }
 
-    // 🚀 实战积木 1：万能路口计数器 (删除了多余的单路口积木，这个全包了！)
+    // 🚀 实战积木 1：万能路口计数器
     //% block="PID巡线 经过 $count 个 $intersectType 后 $action | 冲过速度 $crossSpeed 持续(ms) $crossTime"
     //% count.defl=1 crossSpeed.defl=40 crossTime.defl=300
     //% weight=73
@@ -188,8 +231,6 @@ namespace AnalogLineFollow {
                     }
                     break; // 彻底结束这个方块
                 } else {
-                    // 如果数量还没达标 (遇到了路口但还需要继续走)
-                    // 🚀 核心防抖机制：立刻闭眼冲刺 300 毫秒跨过这根黑线，防止 5 毫秒后把同一根线当成下一个路口！
                     let passSpeed = Math.max(35, _baseSpeed);
                     _setMotorSpeed(passSpeed, passSpeed);
                     basic.pause(300); // 冷却时间 (跨越路口)
@@ -273,47 +314,4 @@ namespace AnalogLineFollow {
         // 实际输出依然会被底层的校准拦截器处理
         _setMotorSpeed(leftSpeed, rightSpeed);
     }
-    // 🚀 实战积木 4：精准校准前进 (带自动刹车)
-    //% block="以 $speed 速度前进 持续(ms) $timeMs"
-    //% speed.min=10 speed.max=100 speed.defl=50
-    //% timeMs.defl=1000
-    //% weight=94
-    export function forwardCalibrated(speed: number, timeMs: number): void {
-        let safeSpeed = Math.abs(speed); // 防呆：防止误填负数
-
-        // 直接调用底层拦截器，它会自动帮你乘上底盘校准比例！
-        _setMotorSpeed(safeSpeed, safeSpeed);
-
-        // 同步状态记忆，方便后续如果接平滑刹车能读取到正确速度
-        _lastLeftSpeed = safeSpeed;
-        _lastRightSpeed = safeSpeed;
-
-        basic.pause(timeMs); // 持续运行设定的时间
-
-        // 跑完瞬间刹车，并清零速度记忆
-        _setMotorSpeed(0, 0);
-        _lastLeftSpeed = 0;
-        _lastRightSpeed = 0;
-    }
-
-    // 🚀 实战积木 5：精准校准后退 (带自动刹车)
-    //% block="以 $speed 速度后退 持续(ms) $timeMs"
-    //% speed.min=10 speed.max=100 speed.defl=50
-    //% timeMs.defl=1000
-    //% weight=93
-    export function backwardCalibrated(speed: number, timeMs: number): void {
-        let safeSpeed = Math.abs(speed);
-
-        // 后退就是加上负号，底层依然会完美按比例分配负电压！
-        _setMotorSpeed(-safeSpeed, -safeSpeed);
-        _lastLeftSpeed = -safeSpeed;
-        _lastRightSpeed = -safeSpeed;
-
-        basic.pause(timeMs);
-
-        _setMotorSpeed(0, 0);
-        _lastLeftSpeed = 0;
-        _lastRightSpeed = 0;
-    }
-
 }
