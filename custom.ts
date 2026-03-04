@@ -1,21 +1,16 @@
 //% color="#00C04A" weight=100 icon="\uf1b9" block="智能IIC实战巡线"
 namespace AnalogLineFollow {
-    // PID 与基础参数
-    let _kp = 0;
-    let _ki = 0;
-    let _kd = 0;
-    let _prevError = 0;
-    let _integral = 0;
-    let _baseSpeed = 60;
-    let _brake = 1;
-    let _internalThreshold = 150;
+    // ==========================================
+    // 全局变量与状态记忆 
+    // ==========================================
+    let _kp = 0; let _ki = 0; let _kd = 0;
+    let _prevError = 0; let _integral = 0;
+    let _baseSpeed = 60; let _brake = 1;
+    let _integralLimit = 1500; 
+    let _lastLeftSpeed = 0; let _lastRightSpeed = 0;
+    let _isWhiteLine = false; 
+    let _isFirstRun = true;    
 
-    // 状态记忆
-    let _lastLeftSpeed = 0;
-    let _lastRightSpeed = 0;
-    let _isWhiteLine = false;
-
-    // 🚀 底盘硬件校准系数（默认1.0，即100%动力）
     let _leftMotorScale = 1.0;
     let _rightMotorScale = 1.0;
 
@@ -47,168 +42,110 @@ namespace AnalogLineFollow {
     export enum IntersectAction {
         //% block="精准急刹"
         Stop,
+        //% block="平滑刹车"
+        SmoothBrake,
         //% block="冲过路口(盲开)"
         CrossOver
     }
 
-    // ==========================================
-    // 🚀 核心底层：所有速度指令必须经过此拦截器！
-    // ==========================================
+    export enum SearchStrategy {
+        //% block="仅前后探测"
+        FrontBack,
+        //% block="仅左右探测"
+        LeftRight,
+        //% block="十字全探测(前后左右)"
+        CrossAll
+    }
+
     function _setMotorSpeed(left: number, right: number): void {
-        let finalL = left * _leftMotorScale;
-        let finalR = right * _rightMotorScale;
-
-        // 限制输出在 -100 到 100 之间，防止数值爆炸
-        finalL = Math.max(-100, Math.min(100, finalL));
-        finalR = Math.max(-100, Math.min(100, finalR));
-
+        let finalL = Math.max(-100, Math.min(100, left * _leftMotorScale));
+        let finalR = Math.max(-100, Math.min(100, right * _rightMotorScale));
         neZha.setMotorSpeed(neZha.MotorList.M1, Math.round(finalL));
         neZha.setMotorSpeed(neZha.MotorList.M2, Math.round(finalR));
     }
+
+    // =================【第一梯队：初始化与校准】=================
 
     //% block="初始化 IIC巡线 Kp $p Ki $i Kd $d 基础速度 $baseSpeed 刹车 $brake 赛道 $line"
     //% p.defl=0.07 i.defl=0 d.defl=0.09 baseSpeed.defl=60 brake.defl=1
     //% weight=100
     export function setPID(p: number, i: number, d: number, baseSpeed: number, brake: number, line: LineType): void {
-        _kp = p;
-        _ki = i;
-        _kd = d;
-        _baseSpeed = baseSpeed;
-        _brake = brake;
+        _kp = p; _ki = i; _kd = d; _baseSpeed = baseSpeed; _brake = brake;
         _isWhiteLine = (line === LineType.White);
-        _integral = 0;
-        _prevError = 0;
+        _integral = 0; _prevError = 0; _isFirstRun = true; 
     }
 
-    // 🚀 实战积木 3：底盘硬件校准 (完美修复输入框Bug)
     //% block="校准底盘：左轮动力 $left | 右轮动力 $right"
     //% left.defl=100 left.min=50 left.max=100
     //% right.defl=100 right.min=50 right.max=100
-    //% weight=95
+    //% weight=99
     export function calibrateMotor(left: number, right: number): void {
-        _leftMotorScale = left / 100.0;
-        _rightMotorScale = right / 100.0;
+        _leftMotorScale = left / 100.0; _rightMotorScale = right / 100.0;
     }
 
-    // 🚀 实战积木 4：精准校准前进 (带自动刹车)
-    //% block="以 $speed 速度前进 持续(ms) $timeMs"
-    //% speed.min=10 speed.max=100 speed.defl=50
-    //% timeMs.defl=1000
-    //% weight=94
-    export function forwardCalibrated(speed: number, timeMs: number): void {
-        let safeSpeed = Math.abs(speed); // 防呆：防止误填负数
+    // =================【第二梯队：核心巡线】=================
 
-        // 直接调用底层拦截器，它会自动帮你乘上底盘校准比例！
-        _setMotorSpeed(safeSpeed, safeSpeed);
+    //% block="执行一次PID灰度巡线"
+    //% weight=95
+    export function pidRun(): void {
+        let error = PlanetX_Basic.TrackBit_get_offset();
+        
+        // 🚀 终极护盾其一：【辅路抗干扰过滤器】(无视单侧辅路)
+        PlanetX_Basic.Trackbit_get_state_value();
+        let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
+        let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
+        let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
+        let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
 
-        // 同步状态记忆，方便后续如果接平滑刹车能读取到正确速度
-        _lastLeftSpeed = safeSpeed;
-        _lastRightSpeed = safeSpeed;
+        let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
+        let l1_on = _isWhiteLine ? raw_l1 : !raw_l1;
+        let r1_on = _isWhiteLine ? raw_r1 : !raw_r1;
+        let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
 
-        basic.pause(timeMs); // 持续运行设定的时间
-
-        // 跑完瞬间刹车，并清零速度记忆
-        _setMotorSpeed(0, 0);
-        _lastLeftSpeed = 0;
-        _lastRightSpeed = 0;
-    }
-
-    // 🚀 实战积木 5：精准校准后退 (带自动刹车)
-    //% block="以 $speed 速度后退 持续(ms) $timeMs"
-    //% speed.min=10 speed.max=100 speed.defl=50
-    //% timeMs.defl=1000
-    //% weight=93
-    export function backwardCalibrated(speed: number, timeMs: number): void {
-        let safeSpeed = Math.abs(speed);
-
-        // 后退就是加上负号，底层依然会完美按比例分配负电压！
-        _setMotorSpeed(-safeSpeed, -safeSpeed);
-        _lastLeftSpeed = -safeSpeed;
-        _lastRightSpeed = -safeSpeed;
-
-        basic.pause(timeMs);
-
-        _setMotorSpeed(0, 0);
-        _lastLeftSpeed = 0;
-        _lastRightSpeed = 0;
-    }
-
-    //% block="平滑起步/变速 目标速度 $targetSpeed 步进延迟(ms) $delayMs"
-    //% targetSpeed.defl=60 delayMs.defl=20
-    //% weight=90
-    export function smoothStart(targetSpeed: number, delayMs: number): void {
-        let currentS = Math.round((_lastLeftSpeed + _lastRightSpeed) / 2);
-        let step = (targetSpeed >= currentS) ? 5 : -5;
-
-        for (let s = currentS; (step > 0 ? s <= targetSpeed : s >= targetSpeed); s += step) {
-            _setMotorSpeed(s, s);
-            _lastLeftSpeed = s;
-            _lastRightSpeed = s;
-            basic.pause(delayMs);
+        if (l1_on || r1_on) { 
+            // 只要主体在主线上，且遇到单侧辅路，直接锁死 error 强制直行！
+            if (r2_on && !l2_on) { error = 0; } 
+            else if (l2_on && !r2_on) { error = 0; }
         }
-        _setMotorSpeed(targetSpeed, targetSpeed);
-        _lastLeftSpeed = targetSpeed;
-        _lastRightSpeed = targetSpeed;
+
+        if (_isFirstRun) { _prevError = error; _isFirstRun = false; }
+
+        _integral += error;
+        _integral = Math.max(-_integralLimit, Math.min(_integralLimit, _integral));
+
+        let derivative = error - _prevError;
+        let adjustment = (_kp * error) + (_ki * _integral) + (_kd * derivative);
+        _prevError = error;
+
+        let curveSharpness = Math.abs(error) / 100;
+        let dynamicBaseSpeed = Math.max(15, _baseSpeed - (curveSharpness * _brake));
+
+        let leftSpeed = dynamicBaseSpeed + adjustment;
+        let rightSpeed = dynamicBaseSpeed - adjustment;
+
+        _lastLeftSpeed = leftSpeed; _lastRightSpeed = rightSpeed;
+        _setMotorSpeed(leftSpeed, rightSpeed);
     }
 
-    //% block="平滑刹车 步进延迟(ms) $delayMs"
-    //% delayMs.defl=20
-    //% weight=80
-    export function smoothBrake(delayMs: number): void {
-        let steps = 10;
-        let leftStep = _lastLeftSpeed / steps;
-        let rightStep = _lastRightSpeed / steps;
+    // =================【第三梯队：复杂赛道处理】=================
 
-        for (let i = 0; i < steps; i++) {
-            _lastLeftSpeed -= leftStep;
-            _lastRightSpeed -= rightStep;
-            _setMotorSpeed(_lastLeftSpeed, _lastRightSpeed);
-            basic.pause(delayMs);
-        }
-        _setMotorSpeed(0, 0);
-        _lastLeftSpeed = 0;
-        _lastRightSpeed = 0;
-    }
-
-    // 🚀 实战积木 2：智能原地死转直到线上
-    //% block="原地死转向 $dir 直到正对线上 | 速度 $speed"
-    //% speed.defl=40
-    //% weight=75
-    export function turnUntilLine(dir: TurnDir, speed: number): void {
-        let leftS = dir === TurnDir.Left ? -speed : speed;
-        let rightS = dir === TurnDir.Left ? speed : -speed;
-
-        _setMotorSpeed(leftS, rightS);
-        basic.pause(200); // 先盲转0.2秒，强行脱离当前压着的黑线
-
-        while (true) {
-            // 调用 V8 引擎的高精度偏移量，只要偏差在 -400 到 400 之间，说明车头已经完美正对黑线！
-            let offset = PlanetX_Basic.TrackBit_get_offset();
-            if (Math.abs(offset) < 400) {
-                break;
-            }
-            basic.pause(5);
-        }
-        _setMotorSpeed(0, 0); // 瞬间死刹
-        _lastLeftSpeed = 0;
-        _lastRightSpeed = 0;
-        basic.pause(50);
-    }
-
-    // 🚀 实战积木 1：万能路口计数器 (修改为遇线瞬间急刹)
     //% block="PID巡线 经过 $count 个 $intersectType 后 $action | 冲过速度 $crossSpeed 持续(ms) $crossTime"
     //% count.defl=1 crossSpeed.defl=40 crossTime.defl=300
-    //% weight=73
+    //% weight=88
     export function pidCrossMultiple(count: number, intersectType: IntersectType, action: IntersectAction, crossSpeed: number, crossTime: number): void {
-        let metCount = 0; // 记录遇到了几个路口
-
+        let metCount = 0; 
         while (metCount < count) {
             PlanetX_Basic.Trackbit_get_state_value();
-            let l2 = PlanetX_Basic.TrackbitgetGray(PlanetX_Basic.TrackbitChannel.One);
-            let r2 = PlanetX_Basic.TrackbitgetGray(PlanetX_Basic.TrackbitChannel.Four);
+            
+            let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
+            let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
+            let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
+            let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
 
-            let l2_on = _isWhiteLine ? (l2 > _internalThreshold) : (l2 < _internalThreshold);
-            let r2_on = _isWhiteLine ? (r2 > _internalThreshold) : (r2 < _internalThreshold);
+            let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
+            let l1_on = _isWhiteLine ? raw_l1 : !raw_l1;
+            let r1_on = _isWhiteLine ? raw_r1 : !raw_r1;
+            let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
 
             let isMet = false;
             if (intersectType === IntersectType.Left) isMet = l2_on;
@@ -217,104 +154,265 @@ namespace AnalogLineFollow {
             else if (intersectType === IntersectType.Any) isMet = (l2_on || r2_on);
 
             if (isMet) {
-                metCount++; // 发现目标路口，计数+1
-
+                metCount++; 
                 if (metCount >= count) {
-                    // 🚀 如果数量达标，执行最终动作（修改为了精准死刹）
                     if (action === IntersectAction.Stop) {
-                        _setMotorSpeed(0, 0);
-                        _lastLeftSpeed = 0;
-                        _lastRightSpeed = 0;
-                        basic.pause(50); // 瞬间死刹并稍微锁死一瞬间，彻底消除物理惯性
+                        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(50); 
+                    } else if (action === IntersectAction.SmoothBrake) {
+                        smoothBrake(10); 
                     } else if (action === IntersectAction.CrossOver) {
-                        _setMotorSpeed(crossSpeed, crossSpeed);
-                        basic.pause(crossTime);
-                        _lastLeftSpeed = crossSpeed;
-                        _lastRightSpeed = crossSpeed;
+                        _setMotorSpeed(crossSpeed, crossSpeed); basic.pause(crossTime);
+                        _lastLeftSpeed = crossSpeed; _lastRightSpeed = crossSpeed;
                     }
-                    break; // 彻底结束这个方块
+                    break; 
                 } else {
-                    let passSpeed = Math.max(35, _baseSpeed);
-                    _setMotorSpeed(passSpeed, passSpeed);
-                    basic.pause(300); // 冷却时间 (跨越路口防抖)
+                    while (true) {
+                        pidRun(); 
+                        PlanetX_Basic.Trackbit_get_state_value();
+                        let check_raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
+                        let check_raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
+                        let check_l2_on = _isWhiteLine ? check_raw_l2 : !check_raw_l2;
+                        let check_r2_on = _isWhiteLine ? check_raw_r2 : !check_raw_r2;
+
+                        let stillMet = false;
+                        if (intersectType === IntersectType.Left) stillMet = check_l2_on;
+                        else if (intersectType === IntersectType.Right) stillMet = check_r2_on;
+                        else if (intersectType === IntersectType.Cross) stillMet = (check_l2_on && check_r2_on);
+                        else if (intersectType === IntersectType.Any) stillMet = (check_l2_on || check_r2_on);
+
+                        if (!stillMet) break; 
+                        basic.pause(5);
+                    }
                 }
-            } else {
-                pidRun(); // 没遇到路口就正常巡线
-                basic.pause(5);
+            } else { 
+                // 🚀 终极护盾其二：【算法3.0 防扭曲+防脱轨】
+                // 当寻找十字路口且单侧踩线，且中间至少有一个在线上时（确认未脱轨），开启直行锁死！
+                if (intersectType === IntersectType.Cross && (l2_on || r2_on) && (l1_on || r1_on)) {
+                    let lockSpeed = Math.max(20, _baseSpeed * 0.5);
+                    _setMotorSpeed(lockSpeed, lockSpeed);
+                } else {
+                    pidRun(); 
+                }
+                basic.pause(5); 
             }
         }
     }
 
+    //% block="虚线巡线(直/弯通用) 基础速度 $baseSpeed 持续(ms) $timeMs"
+    //% baseSpeed.defl=45 timeMs.defl=2000
+    //% weight=85
+    export function pidDashedLine(baseSpeed: number, timeMs: number): void {
+        let endTime = input.runningTime() + timeMs;
+        let lastLeft = baseSpeed; let lastRight = baseSpeed;
+        let wasLost = true; 
+
+        while (input.runningTime() < endTime) {
+            PlanetX_Basic.Trackbit_get_state_value();
+            
+            let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
+            let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
+            let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
+            let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
+
+            let l1_on = _isWhiteLine ? raw_l1 : !raw_l1;
+            let r1_on = _isWhiteLine ? raw_r1 : !raw_r1;
+            let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
+            let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
+
+            if (l1_on || r1_on || l2_on || r2_on) {
+                let error = PlanetX_Basic.TrackBit_get_offset();
+
+                if (wasLost) { _prevError = error; wasLost = false; }
+
+                _integral += error; _integral = Math.max(-_integralLimit, Math.min(_integralLimit, _integral));
+                let derivative = error - _prevError;
+                let adjustment = (_kp * error) + (_ki * _integral) + (_kd * derivative);
+                _prevError = error;
+
+                let leftS = baseSpeed + adjustment;
+                let rightS = baseSpeed - adjustment;
+                lastLeft = leftS; lastRight = rightS;
+                _setMotorSpeed(leftS, rightS);
+            } else { 
+                wasLost = true; 
+                _setMotorSpeed(lastLeft, lastRight); 
+            }
+            basic.pause(10); 
+        }
+        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+    }
+
+    // =================【第四梯队：智能交互与雷达】=================
+
+    //% block="智能找卡并播报 | 探测模式 $strategy 播报次数 $count 间隔(ms) $interval | 搜索超时(ms) $timeout 搜索速度 $speed 探测步距(ms) $stepTime"
+    //% count.defl=2 interval.defl=2000 timeout.defl=10000 speed.defl=40 stepTime.defl=300
+    //% weight=75
+    export function searchAndReadRFID(strategy: SearchStrategy, count: number, interval: number, timeout: number, speed: number, stepTime: number): void {
+        let startTime = input.runningTime();
+        let cardFound = false;
+        let cardData = "";
+        let positionState = 0; 
+
+        function tempMove(lSpeed: number, rSpeed: number, timeMs: number) {
+            _setMotorSpeed(lSpeed, rSpeed); basic.pause(timeMs);
+            _setMotorSpeed(0, 0); basic.pause(100); 
+        }
+
+        while (input.runningTime() - startTime < timeout) {
+            if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+
+            if (strategy === SearchStrategy.FrontBack || strategy === SearchStrategy.CrossAll) {
+                tempMove(speed, speed, stepTime); positionState = 1;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+                tempMove(-speed, -speed, stepTime); positionState = 0; 
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+                
+                tempMove(-speed, -speed, stepTime); positionState = 2;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+                tempMove(speed, speed, stepTime); positionState = 0;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+            }
+
+            if (strategy === SearchStrategy.LeftRight || strategy === SearchStrategy.CrossAll) {
+                tempMove(-speed, speed, stepTime); positionState = 3;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+                tempMove(speed, -speed, stepTime); positionState = 0;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+
+                tempMove(speed, -speed, stepTime); positionState = 4;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+                tempMove(-speed, speed, stepTime); positionState = 0;
+                if (PlanetX_Basic.checkCard()) { cardFound = true; cardData = PlanetX_Basic.readDataBlock(); break; }
+            }
+        }
+
+        if (cardFound) {
+            control.inBackground(function () {
+                for (let i = 0; i < count; i++) {
+                    basic.showString(cardData);
+                    if (i < count - 1) basic.pause(interval);
+                }
+                basic.clearScreen();
+            });
+        } else {
+            control.inBackground(function () {
+                basic.showIcon(IconNames.No);
+                basic.pause(1000);
+                basic.clearScreen();
+            });
+        }
+
+        if (positionState === 1) tempMove(-speed, -speed, stepTime);
+        else if (positionState === 2) tempMove(speed, speed, stepTime);
+        else if (positionState === 3) tempMove(speed, -speed, stepTime);
+        else if (positionState === 4) tempMove(-speed, speed, stepTime);
+        
+        _setMotorSpeed(0, 0); positionState = 0; 
+    }
+
+    // =================【第五梯队：姿态对齐】=================
+
     //% block="自动对齐停止线(十字/T型) | 调整速度 $speed"
     //% speed.defl=30
-    //% weight=71
+    //% weight=65
     export function alignToLine(speed: number): void {
         let alignedCount = 0;
         let timeout = input.runningTime() + 3000;
 
         while (alignedCount < 3 && input.runningTime() < timeout) {
             PlanetX_Basic.Trackbit_get_state_value();
-            let l2 = PlanetX_Basic.TrackbitgetGray(PlanetX_Basic.TrackbitChannel.One);
-            let r2 = PlanetX_Basic.TrackbitgetGray(PlanetX_Basic.TrackbitChannel.Four);
+            
+            let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
+            let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
 
-            let l2_on = _isWhiteLine ? (l2 > _internalThreshold) : (l2 < _internalThreshold);
-            let r2_on = _isWhiteLine ? (r2 > _internalThreshold) : (r2 < _internalThreshold);
+            let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
+            let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
 
-            let leftSpeed = 0;
-            let rightSpeed = 0;
-
+            let leftSpeed = 0; let rightSpeed = 0;
             if (!l2_on) leftSpeed = speed;
             if (!r2_on) rightSpeed = speed;
 
-            if (l2_on && r2_on) {
-                alignedCount++;
-                leftSpeed = 0;
-                rightSpeed = 0;
-            } else {
-                alignedCount = 0;
-            }
+            if (l2_on && r2_on) { alignedCount++; leftSpeed = 0; rightSpeed = 0; } 
+            else { alignedCount = 0; }
 
             _setMotorSpeed(leftSpeed, rightSpeed);
             basic.pause(15);
         }
+        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(100);
+    }
 
+    //% block="原地死转向 $dir 直到正对线上 | 速度 $speed"
+    //% speed.defl=40
+    //% weight=60
+    export function turnUntilLine(dir: TurnDir, speed: number): void {
+        let leftS = dir === TurnDir.Left ? -speed : speed;
+        let rightS = dir === TurnDir.Left ? speed : -speed;
+        _setMotorSpeed(leftS, rightS); basic.pause(200); 
+
+        while (true) {
+            let offset = PlanetX_Basic.TrackBit_get_offset();
+            if (Math.abs(offset) < 400) break;
+            basic.pause(5);
+        }
+        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(50);
+    }
+
+    // =================【第六梯队：基础运动】=================
+
+    //% block="以 $speed 速度前进 持续(ms) $timeMs"
+    //% speed.min=10 speed.max=100 speed.defl=50
+    //% timeMs.defl=1000
+    //% weight=55
+    export function forwardCalibrated(speed: number, timeMs: number): void {
+        let safeSpeed = Math.abs(speed); 
+        _setMotorSpeed(safeSpeed, safeSpeed);
+        _lastLeftSpeed = safeSpeed; _lastRightSpeed = safeSpeed;
+        basic.pause(timeMs); 
+        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+    }
+
+    //% block="以 $speed 速度后退 持续(ms) $timeMs"
+    //% speed.min=10 speed.max=100 speed.defl=50
+    //% timeMs.defl=1000
+    //% weight=54
+    export function backwardCalibrated(speed: number, timeMs: number): void {
+        let safeSpeed = Math.abs(speed); 
+        _setMotorSpeed(-safeSpeed, -safeSpeed);
+        _lastLeftSpeed = -safeSpeed; _lastRightSpeed = -safeSpeed;
+        basic.pause(timeMs);
+        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+    }
+
+    //% block="平滑起步/变速 目标速度 $targetSpeed 步进延迟(ms) $delayMs"
+    //% targetSpeed.defl=60 delayMs.defl=20
+    //% weight=52
+    export function smoothStart(targetSpeed: number, delayMs: number): void {
+        let currentS = Math.round((_lastLeftSpeed + _lastRightSpeed) / 2);
+        let step = (targetSpeed >= currentS) ? 5 : -5;
+        for (let s = currentS; (step > 0 ? s <= targetSpeed : s >= targetSpeed); s += step) {
+            _setMotorSpeed(s, s); _lastLeftSpeed = s; _lastRightSpeed = s; basic.pause(delayMs);
+        }
+        _setMotorSpeed(targetSpeed, targetSpeed); _lastLeftSpeed = targetSpeed; _lastRightSpeed = targetSpeed;
+    }
+
+    //% block="平滑刹车 步进延迟(ms) $delayMs"
+    //% delayMs.defl=20
+    //% weight=50
+    export function smoothBrake(delayMs: number): void {
+        let steps = 10;
+        let leftStep = _lastLeftSpeed / steps; let rightStep = _lastRightSpeed / steps;
+        for (let i = 0; i < steps; i++) {
+            _lastLeftSpeed -= leftStep; _lastRightSpeed -= rightStep;
+            _setMotorSpeed(_lastLeftSpeed, _lastRightSpeed); basic.pause(delayMs);
+        }
+        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+    }
+
+    //% block="停止所有电机"
+    //% weight=45
+    export function stopMotors(): void {
         _setMotorSpeed(0, 0);
         _lastLeftSpeed = 0;
         _lastRightSpeed = 0;
-        basic.pause(100);
-    }
-
-    //% block="执行一次PID灰度巡线"
-    //% weight=70
-    export function pidRun(): void {
-        let error = PlanetX_Basic.TrackBit_get_offset();
-
-        if (_isWhiteLine) {
-            error = -error;
-        }
-
-        _integral += error;
-        let derivative = error - _prevError;
-
-        let adjustment = (_kp * error) + (_ki * _integral) + (_kd * derivative);
-
-        _prevError = error;
-
-        let curveSharpness = Math.abs(error) / 100;
-        let dynamicBaseSpeed = _baseSpeed - (curveSharpness * _brake);
-        dynamicBaseSpeed = Math.max(15, dynamicBaseSpeed);
-
-        let leftSpeed = dynamicBaseSpeed + adjustment;
-        let rightSpeed = dynamicBaseSpeed - adjustment;
-
-        // 这里只限制逻辑计算的速度
-        leftSpeed = Math.max(-100, Math.min(100, leftSpeed));
-        rightSpeed = Math.max(-100, Math.min(100, rightSpeed));
-
-        _lastLeftSpeed = leftSpeed;
-        _lastRightSpeed = rightSpeed;
-
-        // 实际输出依然会被底层的校准拦截器处理
-        _setMotorSpeed(leftSpeed, rightSpeed);
     }
 }
