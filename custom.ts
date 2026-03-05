@@ -198,7 +198,7 @@ namespace AnalogLineFollow {
         }
     }
 
-    //% block="虚线巡线(直/弯通用) 基础速度 $baseSpeed 持续(ms) $timeMs"
+    //% block="PID定时巡线(无视路口/断线) 基础速度 $baseSpeed 持续(ms) $timeMs"
     //% baseSpeed.defl=45 timeMs.defl=2000
     //% weight=85
     export function pidDashedLine(baseSpeed: number, timeMs: number): void {
