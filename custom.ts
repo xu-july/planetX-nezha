@@ -3,7 +3,7 @@ namespace AnalogLineFollow {
     // ==========================================
     // 全局变量与状态记忆 
     // ==========================================
-    let _kp = 0; let _ki = 0; let _kd = 0;
+    let _kp = 0.07; let _ki = 0; let _kd = 0.09;
     let _prevError = 0; let _integral = 0;
     let _baseSpeed = 60; let _brake = 1;
     let _integralLimit = 1500; 
@@ -13,6 +13,15 @@ namespace AnalogLineFollow {
 
     let _leftMotorScale = 1.0;
     let _rightMotorScale = 1.0;
+
+    // 四路灰度（统一读取后的稳定状态：true=踩线）
+    let _l2 = false; let _l1 = false; let _r1 = false; let _r2 = false;
+
+    // 超时保护与抗积分饱和阈值
+    const _INTEGRAL_DEADBAND = 400;
+    const _TURN_TIMEOUT = 2500;
+    const _CROSS_WAIT_TIMEOUT = 3000;
+    const _CROSS_OVERALL_TIMEOUT = 15000;
 
     export enum TurnDir {
         //% block="左"
@@ -64,6 +73,26 @@ namespace AnalogLineFollow {
         neZha.setMotorSpeed(neZha.MotorList.M2, Math.round(finalR));
     }
 
+    // 重置 PID 记忆（积分/微分），避免急刹后或重新起步时出现微分尖峰
+    function _resetPIDState(): void {
+        _integral = 0;
+        _prevError = 0;
+        _isFirstRun = true;
+    }
+
+    // 统一读取四路灰度并做黑白反转，供所有判路逻辑复用
+    function _refreshChannels(): void {
+        PlanetX_Basic.Trackbit_get_state_value();
+        let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
+        let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
+        let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
+        let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
+        _l2 = _isWhiteLine ? raw_l2 : !raw_l2;
+        _l1 = _isWhiteLine ? raw_l1 : !raw_l1;
+        _r1 = _isWhiteLine ? raw_r1 : !raw_r1;
+        _r2 = _isWhiteLine ? raw_r2 : !raw_r2;
+    }
+
     // =================【第一梯队：初始化与校准】=================
 
     //% block="初始化 IIC巡线 Kp $p Ki $i Kd $d 基础速度 $baseSpeed 刹车 $brake 赛道 $line"
@@ -72,7 +101,7 @@ namespace AnalogLineFollow {
     export function setPID(p: number, i: number, d: number, baseSpeed: number, brake: number, line: LineType): void {
         _kp = p; _ki = i; _kd = d; _baseSpeed = baseSpeed; _brake = brake;
         _isWhiteLine = (line === LineType.White);
-        _integral = 0; _prevError = 0; _isFirstRun = true; 
+        _resetPIDState();
     }
 
     //% block="校准底盘：左轮动力 $left | 右轮动力 $right"
@@ -91,27 +120,21 @@ namespace AnalogLineFollow {
         let error = PlanetX_Basic.TrackBit_get_offset();
         
         // 🚀 终极护盾其一：【辅路抗干扰过滤器】(无视单侧辅路)
-        PlanetX_Basic.Trackbit_get_state_value();
-        let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
-        let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
-        let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
-        let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
+        _refreshChannels();
 
-        let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
-        let l1_on = _isWhiteLine ? raw_l1 : !raw_l1;
-        let r1_on = _isWhiteLine ? raw_r1 : !raw_r1;
-        let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
-
-        if (l1_on || r1_on) { 
+        if (_l1 || _r1) { 
             // 只要主体在主线上，且遇到单侧辅路，直接锁死 error 强制直行！
-            if (r2_on && !l2_on) { error = 0; } 
-            else if (l2_on && !r2_on) { error = 0; }
+            if (_r2 && !_l2) { error = 0; _prevError = 0; } 
+            else if (_l2 && !_r2) { error = 0; _prevError = 0; }
         }
 
         if (_isFirstRun) { _prevError = error; _isFirstRun = false; }
 
-        _integral += error;
-        _integral = Math.max(-_integralLimit, Math.min(_integralLimit, _integral));
+        // 抗积分饱和：只在接近中线时累计积分，脱轨时不累计
+        if (Math.abs(error) <= _INTEGRAL_DEADBAND) {
+            _integral += error;
+            _integral = Math.max(-_integralLimit, Math.min(_integralLimit, _integral));
+        }
 
         let derivative = error - _prevError;
         let adjustment = (_kp * error) + (_ki * _integral) + (_kd * derivative);
@@ -134,27 +157,25 @@ namespace AnalogLineFollow {
     //% weight=88
     export function pidCrossMultiple(count: number, intersectType: IntersectType, action: IntersectAction, crossSpeed: number, crossTime: number): void {
         let metCount = 0; 
-        while (metCount < count) {
-            PlanetX_Basic.Trackbit_get_state_value();
-            
-            let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
-            let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
-            let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
-            let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
+        let metStreak = 0;
+        let overallTimeout = input.runningTime() + _CROSS_OVERALL_TIMEOUT;
 
-            let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
-            let l1_on = _isWhiteLine ? raw_l1 : !raw_l1;
-            let r1_on = _isWhiteLine ? raw_r1 : !raw_r1;
-            let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
+        while (metCount < count && input.runningTime() < overallTimeout) {
+            _refreshChannels();
 
             let isMet = false;
-            if (intersectType === IntersectType.Left) isMet = l2_on;
-            else if (intersectType === IntersectType.Right) isMet = r2_on;
-            else if (intersectType === IntersectType.Cross) isMet = (l2_on && r2_on);
-            else if (intersectType === IntersectType.Any) isMet = (l2_on || r2_on);
+            if (intersectType === IntersectType.Left) isMet = _l2;
+            else if (intersectType === IntersectType.Right) isMet = _r2;
+            else if (intersectType === IntersectType.Cross) isMet = (_l2 && _r2);
+            else if (intersectType === IntersectType.Any) isMet = (_l2 || _r2);
 
             if (isMet) {
+                // 去抖：连续两次采样都命中才计一个路口
+                metStreak++;
+                if (metStreak < 2) { basic.pause(3); continue; }
+                metStreak = 0;
                 metCount++; 
+
                 if (metCount >= count) {
                     if (action === IntersectAction.Stop) {
                         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(50); 
@@ -166,28 +187,29 @@ namespace AnalogLineFollow {
                     }
                     break; 
                 } else {
-                    while (true) {
+                    // 通过当前路口：继续 PID，直到该路口条件消失；加超时防卡死
+                    let waitTimeout = input.runningTime() + _CROSS_WAIT_TIMEOUT;
+                    let stillMet = true;
+                    while (stillMet && input.runningTime() < waitTimeout) {
                         pidRun(); 
-                        PlanetX_Basic.Trackbit_get_state_value();
-                        let check_raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
-                        let check_raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
-                        let check_l2_on = _isWhiteLine ? check_raw_l2 : !check_raw_l2;
-                        let check_r2_on = _isWhiteLine ? check_raw_r2 : !check_raw_r2;
-
-                        let stillMet = false;
-                        if (intersectType === IntersectType.Left) stillMet = check_l2_on;
-                        else if (intersectType === IntersectType.Right) stillMet = check_r2_on;
-                        else if (intersectType === IntersectType.Cross) stillMet = (check_l2_on && check_r2_on);
-                        else if (intersectType === IntersectType.Any) stillMet = (check_l2_on || check_r2_on);
-
-                        if (!stillMet) break; 
-                        basic.pause(5);
+                        stillMet = false;
+                        if (intersectType === IntersectType.Left) stillMet = _l2;
+                        else if (intersectType === IntersectType.Right) stillMet = _r2;
+                        else if (intersectType === IntersectType.Cross) stillMet = (_l2 && _r2);
+                        else if (intersectType === IntersectType.Any) stillMet = (_l2 || _r2);
+                        if (stillMet) basic.pause(5);
+                    }
+                    // 若超时仍卡在路口，安全停车并退出
+                    if (stillMet) {
+                        _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+                        return;
                     }
                 }
             } else { 
+                metStreak = 0;
                 // 🚀 终极护盾其二：【算法3.0 防扭曲+防脱轨】
                 // 当寻找十字路口且单侧踩线，且中间至少有一个在线上时（确认未脱轨），开启直行锁死！
-                if (intersectType === IntersectType.Cross && (l2_on || r2_on) && (l1_on || r1_on)) {
+                if (intersectType === IntersectType.Cross && (_l2 || _r2) && (_l1 || _r1)) {
                     let lockSpeed = Math.max(20, _baseSpeed * 0.5);
                     _setMotorSpeed(lockSpeed, lockSpeed);
                 } else {
@@ -195,6 +217,11 @@ namespace AnalogLineFollow {
                 }
                 basic.pause(5); 
             }
+        }
+
+        // 整体超时仍未走够路口数：安全停车
+        if (metCount < count) {
+            _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
         }
     }
 
@@ -207,24 +234,16 @@ namespace AnalogLineFollow {
         let wasLost = true; 
 
         while (input.runningTime() < endTime) {
-            PlanetX_Basic.Trackbit_get_state_value();
-            
-            let raw_l1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Two, PlanetX_Basic.TrackbitType.State_1);
-            let raw_r1 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Three, PlanetX_Basic.TrackbitType.State_1);
-            let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
-            let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
+            _refreshChannels();
 
-            let l1_on = _isWhiteLine ? raw_l1 : !raw_l1;
-            let r1_on = _isWhiteLine ? raw_r1 : !raw_r1;
-            let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
-            let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
-
-            if (l1_on || r1_on || l2_on || r2_on) {
+            if (_l1 || _r1 || _l2 || _r2) {
                 let error = PlanetX_Basic.TrackBit_get_offset();
 
-                if (wasLost) { _prevError = error; wasLost = false; }
+                if (wasLost) { _prevError = error; _integral = 0; wasLost = false; }
 
-                _integral += error; _integral = Math.max(-_integralLimit, Math.min(_integralLimit, _integral));
+                if (Math.abs(error) <= _INTEGRAL_DEADBAND) {
+                    _integral += error; _integral = Math.max(-_integralLimit, Math.min(_integralLimit, _integral));
+                }
                 let derivative = error - _prevError;
                 let adjustment = (_kp * error) + (_ki * _integral) + (_kd * derivative);
                 _prevError = error;
@@ -240,6 +259,7 @@ namespace AnalogLineFollow {
             basic.pause(10); 
         }
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+        _resetPIDState();
     }
 
     // =================【第四梯队：智能交互与雷达】=================
@@ -307,7 +327,9 @@ namespace AnalogLineFollow {
         else if (positionState === 3) tempMove(speed, -speed, stepTime);
         else if (positionState === 4) tempMove(-speed, speed, stepTime);
         
-        _setMotorSpeed(0, 0); positionState = 0; 
+        _setMotorSpeed(0, 0);
+        _lastLeftSpeed = 0; _lastRightSpeed = 0;
+        _resetPIDState(); 
     }
 
     // =================【第五梯队：姿态对齐】=================
@@ -320,19 +342,13 @@ namespace AnalogLineFollow {
         let timeout = input.runningTime() + 3000;
 
         while (alignedCount < 3 && input.runningTime() < timeout) {
-            PlanetX_Basic.Trackbit_get_state_value();
-            
-            let raw_l2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.One, PlanetX_Basic.TrackbitType.State_1);
-            let raw_r2 = PlanetX_Basic.TrackbitChannelState(PlanetX_Basic.TrackbitChannel.Four, PlanetX_Basic.TrackbitType.State_1);
-
-            let l2_on = _isWhiteLine ? raw_l2 : !raw_l2;
-            let r2_on = _isWhiteLine ? raw_r2 : !raw_r2;
+            _refreshChannels();
 
             let leftSpeed = 0; let rightSpeed = 0;
-            if (!l2_on) leftSpeed = speed;
-            if (!r2_on) rightSpeed = speed;
+            if (!_l2) leftSpeed = speed;
+            if (!_r2) rightSpeed = speed;
 
-            if (l2_on && r2_on) { alignedCount++; leftSpeed = 0; rightSpeed = 0; } 
+            if (_l2 && _r2) { alignedCount++; leftSpeed = 0; rightSpeed = 0; } 
             else { alignedCount = 0; }
 
             _setMotorSpeed(leftSpeed, rightSpeed);
@@ -349,9 +365,16 @@ namespace AnalogLineFollow {
         let rightS = dir === TurnDir.Left ? speed : -speed;
         _setMotorSpeed(leftS, rightS); basic.pause(200); 
 
-        while (true) {
+        let stable = 0;
+        let endTime = input.runningTime() + _TURN_TIMEOUT;
+        while (input.runningTime() < endTime) {
             let offset = PlanetX_Basic.TrackBit_get_offset();
-            if (Math.abs(offset) < 400) break;
+            if (Math.abs(offset) < 400) {
+                stable++;
+                if (stable >= 2) break;
+            } else {
+                stable = 0;
+            }
             basic.pause(5);
         }
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(50);
@@ -369,6 +392,7 @@ namespace AnalogLineFollow {
         _lastLeftSpeed = safeSpeed; _lastRightSpeed = safeSpeed;
         basic.pause(timeMs); 
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+        _resetPIDState();
     }
 
     //% block="以 $speed 速度后退 持续(ms) $timeMs"
@@ -381,6 +405,7 @@ namespace AnalogLineFollow {
         _lastLeftSpeed = -safeSpeed; _lastRightSpeed = -safeSpeed;
         basic.pause(timeMs);
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+        _resetPIDState();
     }
 
     //% block="平滑起步/变速 目标速度 $targetSpeed 步进延迟(ms) $delayMs"
@@ -406,6 +431,7 @@ namespace AnalogLineFollow {
             _setMotorSpeed(_lastLeftSpeed, _lastRightSpeed); basic.pause(delayMs);
         }
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+        _resetPIDState();
     }
 
     //% block="停止所有电机"
@@ -414,5 +440,6 @@ namespace AnalogLineFollow {
         _setMotorSpeed(0, 0);
         _lastLeftSpeed = 0;
         _lastRightSpeed = 0;
+        _resetPIDState();
     }
 }
