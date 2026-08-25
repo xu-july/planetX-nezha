@@ -1,7 +1,7 @@
 {
     "name": "行星-哪吒",
-    "version": "2.0.1",
-    "description": "",
+    "version": "3.0.0",
+    "description": "智能IIC实战巡线（稳定版）：辅路抗干扰 + 防脱轨 + 超时保护 + 去抖 + 抗积分饱和",
     "dependencies": {
         "core": "*",
         "radio": "*",
