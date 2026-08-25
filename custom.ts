@@ -179,11 +179,13 @@ namespace AnalogLineFollow {
                 if (metCount >= count) {
                     if (action === IntersectAction.Stop) {
                         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(50); 
+                        _resetPIDState();
                     } else if (action === IntersectAction.SmoothBrake) {
                         smoothBrake(10); 
                     } else if (action === IntersectAction.CrossOver) {
                         _setMotorSpeed(crossSpeed, crossSpeed); basic.pause(crossTime);
                         _lastLeftSpeed = crossSpeed; _lastRightSpeed = crossSpeed;
+                        _resetPIDState();
                     }
                     break; 
                 } else {
@@ -202,6 +204,7 @@ namespace AnalogLineFollow {
                     // 若超时仍卡在路口，安全停车并退出
                     if (stillMet) {
                         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+                        _resetPIDState();
                         return;
                     }
                 }
@@ -222,6 +225,7 @@ namespace AnalogLineFollow {
         // 整体超时仍未走够路口数：安全停车
         if (metCount < count) {
             _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0;
+            _resetPIDState();
         }
     }
 
@@ -355,6 +359,7 @@ namespace AnalogLineFollow {
             basic.pause(15);
         }
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(100);
+        _resetPIDState();
     }
 
     //% block="原地死转向 $dir 直到正对线上 | 速度 $speed"
@@ -378,6 +383,7 @@ namespace AnalogLineFollow {
             basic.pause(5);
         }
         _setMotorSpeed(0, 0); _lastLeftSpeed = 0; _lastRightSpeed = 0; basic.pause(50);
+        _resetPIDState();
     }
 
     // =================【第六梯队：基础运动】=================
